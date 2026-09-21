@@ -68,6 +68,7 @@ def add_args(
     parser.add_argument("-mcl", "--moe_cpu_offload", type = int, help = "Experimental: run the routed experts of the first N block-sparse MoE layers on the CPU, with expert weights in system RAM. Layer-split mode only; requires mul1-codebook experts (ineligible layers fall back to the GPU)", default = 0)
     parser.add_argument("-mcs", "--moe_cpu_split", type = int, help = "Experimental: per-layer expert split — run the TAIL N routed experts of every eligible block-sparse MoE layer on the CPU, overlapping the CPU GEMMs with each layer's own GPU expert compute. Dynamic hot/cold expert placement is on by default (EXL3_MOE_CPU_SWAP=0 for static placement). Mutually exclusive with --moe_cpu_offload. Layer-split mode only; requires mul1-codebook experts", default = 0)
     parser.add_argument("-mcpa", "--moe_cpu_pinned_arena", action = "store_true", help = "Experimental: back the CPU MoE worker's expert arena with shared, page-locked memory, so streamed prefill DMAs experts straight out of it and --moe_cpu_split promotes experts into spare GPU slots on the fly (promote-on-miss placement). Costs ~0.2 s per GiB at load and counts the arena in both processes' RSS")
+    parser.add_argument("-kvo", "--kv_offload", action = "store_true", help = "Store QSA attention K/V and the indexer's raw key plane in pinned host memory (read zero-copy over PCIe) instead of VRAM, leaving only the pooled plane on the device (0.75 vs 27.75 KiB/token of VRAM). Trades a constant per-token PCIe read for a VRAM saving linear in context length. EXL3_QSA_KVO_RAW=0 keeps the raw plane in VRAM. QSA models only; not compatible with a quantized cache or with --cpu_cache_size")
     parser.add_argument("-mct", "--moe_cpu_threads", type = int, help = "Worker thread count for --moe_cpu_offload / --moe_cpu_split (default: EXL3_MOE_CPU_THREADS env, else physical cores minus EXL3_MOE_HOST_CORES)", default = None)
     parser.add_argument("-ngl", "--ngram_lock", action = "store_true", help = "As --ngram_ram, and lock the table's pages in RAM (mlock) so they are never swapped out or reclaimed; needs RLIMIT_MEMLOCK (ulimit -l) to cover the table, or CAP_IPC_LOCK")
     parser.add_argument("-ngr", "--ngram_ram", action = "store_true", help = "Load an n-gram embedding table (PLE models, e.g. Qwen3.8-Flash-Next) fully into system RAM instead of streaming rows from disk per forward (tens of GB of RAM; avoids per-token disk reads)")
@@ -237,6 +238,12 @@ def init(
         config.infer_params.ngram_lock = True
     if getattr(args, "embed_disk", False):
         config.infer_params.embed_stream_from_disk = True
+    if getattr(args, "kv_offload", False):
+        # Both would keep a copy of every page in system RAM, and the CPU tier's page images
+        # would not include the K/V it no longer owns
+        assert not getattr(args, "cpu_cache_size", 0), \
+            "--kv_offload and --cpu_cache_size are mutually exclusive: K/V already lives in host memory"
+        config.infer_params.qsa_kv_offload = True
     if override_dynamic_seq_len: config.override_dynamic_seq_len(override_dynamic_seq_len)
     dmcl = getattr(args, "draft_moe_cpu_layers", 0)
     dmclt = getattr(args, "moe_cpu_threads", None)
