@@ -57,6 +57,14 @@ class InferParams:
         # per-forward row gathers instead of loading the whole table into system RAM (tens of
         # GB). Set before loading the model
         self.ngram_stream_from_disk = os.environ.get("EXL3_NGRAM_STREAM", "1") != "0"
+        # Keep QSA attention's K/V planes, and the indexer's raw key plane, in pinned
+        # device-mapped host memory instead of VRAM, leaving only the pooled plane on the device.
+        # Both are read in amounts fixed by the indexer budget rather than by context length --
+        # the gather takes a top-k selection, the pool rebuild only touches the write head -- so
+        # the PCIe cost is constant while the VRAM saved is linear, which is what buys the very
+        # long contexts. The pooled plane is NOT offloaded: it is scanned in full every step. Set
+        # before loading the model
+        self.qsa_kv_offload = os.environ.get("EXL3_QSA_KV_OFFLOAD", "0") != "0"
 
     def use_mgemm(self, K: int, out_features: int, mul1: bool = False, device = None) -> bool:
         # Unfusing only pays when the separate GEMV calls can actually take the int8 path, which

@@ -10,6 +10,7 @@ from .multilinear import MultiLinear, SlicedMultiLinear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from ..util import profile_opt
+from ..util import qsa_kvo_stats
 import os
 from .attention_fn.bc_attn import bc_attn_enable as _bc_attn_enable, build_bc_attn, MAX_BSZ as _bc_max_bsz, MAX_QLEN as _bc_max_qlen
 
@@ -970,6 +971,12 @@ class Attention(Module):
         from ..cache.fp16 import CacheLayer_fp16
         from ..cache.quant import CacheLayer_quant
         from ..cache.qsa import CacheLayer_qsa, CacheLayer_qsa_quant
+        if self.config is not None and getattr(self.config.infer_params, "qsa_kv_offload", False):
+            assert not issubclass(default, CacheLayer_quant), \
+                "QSA KV offload (-kvo) needs the fp16 cache layer: it replaces KV quantization, " \
+                "not stacks with it"
+            from ..cache.qsa_offload import CacheLayer_qsa_offload
+            return CacheLayer_qsa_offload, kwargs
         if issubclass(default, CacheLayer_quant):
             return CacheLayer_qsa_quant, kwargs
         assert issubclass(default, CacheLayer_fp16), \
@@ -1108,6 +1115,15 @@ class Attention(Module):
             o = self.bc_attn_step(x, cache, params, block_table, cache_seqlens,
                                   host_seqlens = qsa_seqlens_cpu)
             if o is not None:
+                if qsa_sparse and qsa_kvo_stats.enabled():
+                    # The selection is built inside the capture, so only the padded bound is
+                    # visible from here. Same widths as select_indices_paged / _qsa_sparse_geometry
+                    idx = self.qsa_indexer
+                    cr = idx.compress_ratio
+                    k_pad = -(-(idx.block_topk * cr + cr - 1) // 32) * 32
+                    qsa_kvo_stats.record_sparse(
+                        self.layer_idx, bsz * seqlen, k_pad, self.num_kv_heads, self.head_dim,
+                        decode = True)
                 return o
 
         if self.qsa_indexer is not None:

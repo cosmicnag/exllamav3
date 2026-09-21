@@ -111,8 +111,19 @@ class CPUPageCache:
         # the workers and the ranks hold the host buffers themselves.
         self.segments = []
         offset = 0
+        from ..cache.qsa_offload import CacheLayer_qsa_offload
         for cache in local_caches:
             for layer in cache.layers.values():
+                # Exclusive with the KV offload. Living in host memory is not the same as
+                # surviving eviction -- an offloaded page is still recycled for the next
+                # sequence -- so the tier would have to keep copying those planes into its own
+                # slots to restore anything, which is the same host RAM spent twice. Narrowing
+                # the tier to the planes still in VRAM is not an option either: a page image
+                # without K/V restores the wrong K/V
+                assert not isinstance(layer, CacheLayer_qsa_offload), \
+                    "CPU page cache tier cannot be combined with QSA KV offload (--kv_offload): " \
+                    "the offloaded planes are already host-resident, and a page image without " \
+                    "them could not restore a page correctly."
                 for t in layer.get_tensors():
                     if t is None:
                         continue

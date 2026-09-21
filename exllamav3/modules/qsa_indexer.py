@@ -691,8 +691,34 @@ class QSAIndexer(Module):
         """
         from .attention_fn.qsa_triton import qsa_sparse_attend_rows
         from ..cache.quant import CacheLayer_quant
+        from ..util import qsa_kvo_stats
         bsz, seq = q.shape[:2]
         indices = self.select_indices_paged(layer, q_idx, block_table, cache_seqlens_cpu)
+        if qsa_kvo_stats.enabled():
+            qsa_kvo_stats.record_sparse(
+                attn.layer_idx, bsz * seq, indices.shape[1], attn.num_kv_heads, attn.head_dim,
+                indices = indices)
+        qf = q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous()
+        page_size = layer.k.shape[1]
+
+        # Host-resident K/V: every row of a prefill chunk would otherwise pull its own ~2048
+        # selections across PCIe, re-reading the same history thousands of times per chunk. Stage
+        # the page range through a VRAM arena instead, so each page crosses once. Needs one shared
+        # page table, so batched/verify calls keep the direct path (their row counts are small
+        # enough that it is the cheaper one anyway)
+        from ..cache.qsa_offload import CacheLayer_qsa_offload
+        if isinstance(layer, CacheLayer_qsa_offload) and bsz == 1:
+            from .attention_fn.qsa_triton import (
+                qsa_staging_worthwhile, qsa_sparse_attend_rows_staged)
+            npu = -(-(int(cache_seqlens_cpu.max().item()) + seq) // page_size)
+            npu = min(npu, block_table.shape[1])
+            if qsa_staging_worthwhile(bsz * seq, indices.shape[1], npu, page_size):
+                o = qsa_sparse_attend_rows_staged(
+                    qf, layer.k, layer.v, indices, attn.sm_scale,
+                    block_table[0].int().contiguous(), npu, layer_idx = attn.layer_idx,
+                )
+                return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)
+
         bt_rows = block_table.int().unsqueeze(1).expand(bsz, seq, -1) \
             .reshape(bsz * seq, -1).contiguous()
         if isinstance(layer, CacheLayer_quant):
@@ -704,7 +730,7 @@ class QSAIndexer(Module):
             v_arg = layer.v.view(-1, attn.num_kv_heads, attn.head_dim)
             qc, page_size = None, layer.k.shape[1]
         o = qsa_sparse_attend_rows(
-            q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous(),
+            qf,
             k_arg, v_arg, indices, attn.sm_scale,
             block_table = bt_rows, page_size = page_size,
             qc = qc, n_kv_heads = attn.num_kv_heads,
