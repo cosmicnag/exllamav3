@@ -29,6 +29,7 @@ paged/BC form runs decode rows (q_len == 1), the flat form any (B * S) row set. 
 runtime arguments or derived on device, so the kernels are CUDA-graph-safe.
 """
 
+import os
 import torch
 
 import triton
@@ -256,6 +257,181 @@ def _get_sms(dev):
     if dev.index not in _sm_counts:
         _sm_counts[dev.index] = torch.cuda.get_device_properties(dev.index).multi_processor_count
     return _sm_counts[dev.index]
+
+
+
+# Default staging arena per device, in bytes (EXL3_QSA_KVO_ARENA). Deliberately small: this
+# path exists for configurations where VRAM is the binding constraint, and on one packed to
+# the brim by autosplit even a couple of hundred MB per device is the difference between
+# loading and not. A smaller arena only means more buckets, and the transfer volume -- the
+# thing being fixed here -- is identical either way; only the kernel's own re-scan of the
+# selection is repeated. Raise it when there is headroom to spare
+ARENA_BYTES = int(os.environ.get("EXL3_QSA_KVO_ARENA", 32 * 1024 ** 2))
+
+# EXL3_QSA_KVO_STAGE=0 forces the direct (per-row, straight-from-host) gather, for A/B
+STAGING_ENABLED = os.environ.get("EXL3_QSA_KVO_STAGE", "1") != "0"
+
+# Query rows per kernel launch. The launch's partial buffers are linear in this, and they are
+# charged against exactly the VRAM the offload exists to free, so a long prefill chunk is
+# served a block at a time. The blocks run inside the staging loop, against an arena that is
+# already filled, so splitting them costs launches and not a single extra byte over PCIe
+STAGE_ROWS = int(os.environ.get("EXL3_QSA_KVO_STAGE_ROWS", 1024))
+
+
+def qsa_staging_worthwhile(rows: int, k_pad: int, num_pages_used: int, page_size: int) -> bool:
+    """Is staging the page range cheaper than letting the gather read host memory directly?
+
+    The direct path reads rows * k_pad cache positions (every row fetches its own selection
+    over PCIe, and rows overlap heavily); staging reads each page of the history exactly once,
+    i.e. num_pages_used * page_size positions. Prefill chunks sit far on the staging side of
+    that comparison -- 2048 rows x 2080 selections against a history of at most ~4096 pages --
+    while a one-row decode fallback sits on the other."""
+    return STAGING_ENABLED and rows * k_pad > 2 * num_pages_used * page_size
+
+
+def qsa_sparse_attend_rows_staged(
+    q: torch.Tensor,               # (R, n_q_heads, head_dim) fp16, normed + roped
+    k_cache: torch.Tensor,         # (pages, page_size, n_kv_heads, head_dim) fp16, HOST-resident
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,         # (R, K_pad) int32 cache positions, -1 padded
+    sm_scale: float,
+    block_table: torch.Tensor,     # (num_pages,) int32, the sequence's page table
+    num_pages_used: int,           # pages of it the selection can reach
+    arena_bytes: int = 0,
+    layer_idx: int | None = None,
+) -> torch.Tensor:
+    """Sparse gather over a host-resident K/V cache, staging the history through a VRAM arena
+    instead of letting every query row pull its own selection over PCIe.
+
+    Rows in a prefill chunk each pick ~2048 cache positions, and the union of those picks
+    approaches the whole history, so the direct path re-reads the same pages thousands of
+    times per chunk -- constant per row, but multiplied by the row count. Here the page range
+    is walked once: each bucket of pages is copied host -> arena in one pass, every query row
+    is scored against it, and the bucket's partial (o, m, l) is folded into a running softmax.
+    Each page therefore crosses PCIe exactly once per chunk per layer, whatever the row count.
+
+    Staging is the outer loop and query rows the inner one, deliberately: blocking the rows
+    bounds the kernel's partial buffers (they are charged against the same VRAM the offload
+    exists to free), and doing it inside the bucket keeps that free -- the other nesting would
+    re-stage the whole page range once per row block.
+
+    All rows must share one page table (bsz == 1), which is what prefill and every
+    single-sequence eager fallback give us.
+    """
+    from ...util import qsa_kvo_stats
+
+    R, H, hd = q.shape
+    kvh = k_cache.shape[2]
+    page_size = k_cache.shape[1]
+    group = H // kvh
+    BLOCK_H = 16
+    BLOCK_N = 32
+    h_blocks = triton.cdiv(group, BLOCK_H)
+    K_pad = indices.shape[1]
+    dev = q.device
+    assert q.is_contiguous() and indices.is_contiguous()
+    assert K_pad % BLOCK_N == 0, "staged path needs K_pad aligned to the kernel's BLOCK_N"
+
+    # Every workspace here is allocated per call and released with it, like the direct path's
+    # partials. Keeping them in the shared tensor cache instead would subtract permanently
+    # from the allocator's pool, and on a device autosplit has packed to the brim what has to
+    # fit is the largest single module's peak, not the sum of everyone's
+    page_bytes = page_size * kvh * hd * 2
+    arena_pages = max(1, (arena_bytes or ARENA_BYTES) // (2 * page_bytes))
+    arena_pages = min(arena_pages, num_pages_used)
+    k_arena = torch.empty((arena_pages, page_size, kvh, hd), dtype = torch.half, device = dev)
+    v_arena = torch.empty((arena_pages, page_size, kvh, hd), dtype = torch.half, device = dev)
+    k_flat = k_arena.view(-1, kvh, hd)
+    v_flat = v_arena.view(-1, kvh, hd)
+
+    rb = min(STAGE_ROWS, R)
+    po = torch.empty((rb * kvh * h_blocks * BLOCK_H * hd,), dtype = torch.float, device = dev)
+    pml = torch.empty((rb * kvh * h_blocks * BLOCK_H * 2,), dtype = torch.float, device = dev)
+    out = torch.empty((R, H, hd), dtype = torch.half, device = dev)
+
+    # One bucket is the common case (the whole reachable history fits the arena), and there is
+    # then nothing to fold: the kernel's own partial IS the result, and no selection has to be
+    # masked because every page is present
+    single = num_pages_used <= arena_pages
+    if not single:
+        acc = torch.zeros((R, kvh, group, hd), dtype = torch.float, device = dev)
+        m = torch.full((R, kvh, group), -float("inf"), dtype = torch.float, device = dev)
+        l = torch.zeros((R, kvh, group), dtype = torch.float, device = dev)
+        idx_buf = torch.empty((rb, K_pad), dtype = torch.int32, device = dev)
+        neg1 = torch.tensor(-1, dtype = torch.int32, device = dev)
+        zero = torch.zeros((), dtype = torch.float, device = dev)
+
+    pages = torch.arange(block_table.shape[0], dtype = torch.int32, device = dev)
+
+    for p0 in range(0, num_pages_used, arena_pages):
+        p1 = min(p0 + arena_pages, num_pages_used)
+        n = p1 - p0
+
+        # Host -> arena, one contiguous read per page. Stream-ordered ahead of the kernels
+        sel = block_table[p0 : p1].long()
+        torch.index_select(k_cache, 0, sel, out = k_arena[:n])
+        torch.index_select(v_cache, 0, sel, out = v_arena[:n])
+        if qsa_kvo_stats.enabled() and layer_idx is not None:
+            qsa_kvo_stats.record_stage(layer_idx, 2 * n * page_bytes)
+
+        # A page table that redirects this bucket's pages to their arena slots. Entries
+        # outside it are never loaded (their selections are masked to -1 below), so the
+        # clamped values they hold do not matter
+        bt_arena = (pages - p0).clamp_(0, max(n - 1, 0)).unsqueeze(0)
+        lo, hi = p0 * page_size, p1 * page_size
+
+        for r0 in range(0, R, rb):
+            r1 = min(r0 + rb, R)
+            rows = r1 - r0
+            programs = rows * kvh * h_blocks
+            idx_r = indices[r0 : r1]
+            if single:
+                idx_use = idx_r
+            else:
+                # Pages map to contiguous position ranges, so restricting the selection to
+                # this bucket is a range test on the cache positions themselves
+                idx_use = idx_buf[:rows]
+                torch.where((idx_r >= lo) & (idx_r < hi), idx_r, neg1, out = idx_use)
+
+            with torch.cuda.device(dev):
+                _qsa_sparse_split_kernel[(programs, 1)](
+                    q[r0 : r1], k_flat, v_flat, bt_arena, idx_use, po, pml,
+                    K_pad, 0, 1, K_pad,
+                    q, q, q,   # fp16 staged planes: k_scales / v_scales / h32 unused
+                    n_q_heads = H, n_kv_heads = kvh, page_size = page_size,
+                    head_dim = hd, K_pad = K_pad, scale = float(sm_scale),
+                    BLOCK_H = BLOCK_H, BLOCK_N = BLOCK_N, PAGED = 1,
+                    num_warps = 4, num_stages = 2,
+                )
+
+            # pid = (row * n_kv_heads + kv_head) * h_blocks + h_block, and within a program
+            # row r is q head kv_head * group + h_block * BLOCK_H + r, so the program/row axes
+            # unflatten straight into (rows, kv_head, q head in group) once BLOCK_H's padding
+            # past group is dropped
+            po_v = po[: programs * BLOCK_H * hd] \
+                .view(rows, kvh, h_blocks * BLOCK_H, hd)[:, :, :group]
+            pml_v = pml[: programs * BLOCK_H * 2] \
+                .view(rows, kvh, h_blocks * BLOCK_H, 2)[:, :, :group]
+            if single:
+                o = po_v / pml_v[..., 1].clamp_min(1e-30).unsqueeze(-1)
+                out[r0 : r1] = o.reshape(rows, H, hd).to(torch.half)
+                continue
+
+            # Fold this bucket into the running softmax. A bucket a row selected nothing from
+            # arrives as m = -inf / l = 0 and contributes nothing
+            a_r, m_r, l_r = acc[r0 : r1], m[r0 : r1], l[r0 : r1]
+            m_b, l_b = pml_v[..., 0], pml_v[..., 1]
+            m_new = torch.maximum(m_r, m_b)
+            alpha = torch.where(m_r > -float("inf"), torch.exp(m_r - m_new), zero)
+            beta = torch.where(m_b > -float("inf"), torch.exp(m_b - m_new), zero)
+            a_r.mul_(alpha.unsqueeze(-1)).add_(po_v * beta.unsqueeze(-1))
+            l_r.mul_(alpha).add_(l_b * beta)
+            m_r.copy_(m_new)
+
+    if not single:
+        o = acc / l.clamp_min(1e-30).unsqueeze(-1)
+        out.copy_(o.reshape(R, H, hd))
+    return out
 
 
 def qsa_sparse_attend_rows(
