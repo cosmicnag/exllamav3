@@ -5,6 +5,84 @@
 
 [Installation](#installation) · [Supported models](#architecture-support) · [Examples](#examples) · [Quantization](#exl3-quantization) · [Community](#community)
 
+---
+
+## Fork: QSA KV offload · branch `deploy/exllamav3-kvo`
+
+> [!IMPORTANT]
+> This is a fork of [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3), kept for serving **Qwen3.8-Flash-Next (EXL3)** at very long context. Everything below this section is upstream's README and applies unchanged — the only fork-specific content is this section.
+
+**Branch** [`deploy/exllamav3-kvo`](https://github.com/cosmicnag/exllamav3/tree/deploy/exllamav3-kvo) · **Base** upstream `dev` @ `e3b52f47` · **Delta** 2 commits, **Python only**
+
+### What it adds
+
+QSA attention normally keeps three planes in VRAM per cache token. This fork moves the two that are read in *bounded* amounts into pinned, device-mapped host memory, read zero-copy over PCIe:
+
+| plane | placement | VRAM |
+|---|---|---|
+| `k`, `v` (gathered) | pinned host RAM | — |
+| indexer `raw_k` | pinned host RAM (`EXL3_QSA_KVO_RAW=0` keeps it in VRAM) | — |
+| indexer `pooled` | **VRAM — not offloaded** | 0.75 KiB/token |
+| | | **0.75 vs 27.75 KiB/token** |
+
+The trade only works because of *which* planes move. `pooled` is scored in full on every step, so its traffic is linear in context length and it has to stay on the device — at 1M context that plane alone is ~732 MiB of traffic per step. K/V are read through a top-k selection whose size is fixed by the indexer budget, and `raw_k` only around the write head, where the pool kernel rebuilds just the blocks an append touches. Both are constant in context length, so the PCIe cost is constant while the VRAM saving is linear — which is what buys the very long contexts.
+
+The gather kernels reach K/V through a base pointer plus computed offsets and never read a stride or device property of those tensors, so handing them a zero-copy CUDA alias of host memory needs no kernel change: `sparse_attend`, `get_kv` and `ext.paged_kv_cache_update` all keep working.
+
+### Requirements
+
+- **Linux + CUDA.** The slab is anonymous `mmap` memory registered with `cudaHostRegister(PORTABLE | MAPPED)` while the layer's device is current — not a `pin_memory=True` tensor.
+- A **QSA-attention model**, i.e. Qwen3.8-Flash-Next EXL3 (`qwen4_exp`).
+- **fp16 cache layer.** Not compatible with a quantized cache, and mutually exclusive with `--cpu_cache_size` (K/V already lives in host memory).
+- **Host RAM** for the slab, allocated eagerly from full cache capacity rather than per used page: ~6.4 GiB at 262K across the model's 12 QSA layers.
+
+### Getting running
+
+```sh
+git clone -b deploy/exllamav3-kvo https://github.com/cosmicnag/exllamav3.git
+cd exllamav3
+# install a CUDA-enabled torch first (see Installation below), then:
+pip install -e .
+```
+
+Then set the switch **before the model config is built**, i.e. in the environment of the process that loads the model:
+
+```sh
+export EXL3_QSA_KV_OFFLOAD=1
+```
+
+TabbyAPI users can pass `-kvo` as a model arg instead. **Omitting it silently loads with no offload** — the default is `0`.
+
+#### Knobs
+
+| env | default | what it does |
+|---|---|---|
+| `EXL3_QSA_KV_OFFLOAD` | `0` | master switch; the `-kvo` CLI flag is equivalent |
+| `EXL3_QSA_KVO_RAW` | `1` | also offload the indexer's raw key plane; `0` keeps it in VRAM (the phase-1 placement) |
+| `EXL3_QSA_KVO_ARENA` | 32 MiB | per-device staging arena for the history-page walk. A smaller arena only means more buckets — the PCIe volume is identical either way — but the kernel re-scans the selection per pass. Raise it when there is VRAM headroom to spare: the 32 MiB default stages ~32 of 1024 pages per pass and costs ~17% prefill at 200K (3,238 T/s); 512 MiB amortizes the walk and recovers it (~3,905 T/s) |
+| `EXL3_QSA_KVO_STAGE` | `1` | `0` forces the direct per-row gather straight from host memory (for A/B) |
+| `EXL3_QSA_KVO_STAGE_ROWS` | 1024 | query rows per kernel launch. The launch's partial buffers are linear in this and are charged against exactly the VRAM the offload exists to free, so a long prefill chunk is served a block at a time |
+| `EXL3_QSA_KVO_STATS` | `0` | `1` prints a per-layer table at shutdown: sparse rows served, positions selected, host→device MiB, staged MiB |
+
+**Verify the claim it rests on:** run with `EXL3_QSA_KVO_STATS=1` and watch `sel/row` — it should stay flat as context grows. That column is the constant-read assumption; if it moves, the design's premise is wrong for your model.
+
+### Caveats
+
+- **Not upstream-supported.** This branch is a rebase surface — expect it to be rebased onto upstream `dev` rather than merged. Upstream publishes the patch as a file only; there is no PR channel.
+- Offloading reduces QSA VRAM cost, it does not remove it: `pooled` stays on the device and is the floor.
+- The host slab is committed up front from full cache capacity, so the RAM cost is paid whether or not the context is used.
+- For two concurrent 262K sessions the slab is ~13.5 GiB (capacity is a shared pool across sequences), not ~6.4 GiB.
+
+### For agents
+
+- Branch `deploy/exllamav3-kvo` = upstream `dev` @ `e3b52f47` + `db8fefec` (the port) + `0ceb06ef` (`page_size` lookup fix in `QSAIndexer.sparse_attend` for quant caches).
+- Touched files: `exllamav3/cache/qsa_offload.py` (new), `exllamav3/util/qsa_kvo_stats.py` (new), `exllamav3/modules/attention_fn/qsa_triton.py`, `exllamav3/modules/qsa_indexer.py`, `exllamav3/modules/attn.py`, `exllamav3/model/config.py`, `exllamav3/model_init.py`, `exllamav3/generator/cpu_cache.py`.
+- **The 2 commits are pure Python.** If your build is a *non-editable* install of base `e3b52f47`, copying those 8 files into site-packages *is* the deploy — no CUDA extension rebuild. Confirm with `git diff --name-only e3b52f47..deploy/exllamav3-kvo | grep -v '\.py$'` (empty) and by checking that no `ext.*` symbol appears only on the `+` side of the Python diff.
+- `direct_url.json` in site-packages may name a different source tree than the one actually installed; diff the tree instead of trusting it.
+- Failure modes: `--kv_offload` + `--cpu_cache_size` raises at startup; a quantized cache raises in `attn.py`; without `EXL3_QSA_KV_OFFLOAD=1` you get a silent fp16 load that OOMs at any cache size the offload was needed for.
+
+---
+
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs, with flexible quantization and parallel inference.
 
 - **Quantization** - [EXL3](doc/exl3.md), based on QTIP, plus 2–8 bit cache quantization.
