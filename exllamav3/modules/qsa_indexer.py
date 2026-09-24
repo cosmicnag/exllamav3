@@ -699,7 +699,8 @@ class QSAIndexer(Module):
                 attn.layer_idx, bsz * seq, indices.shape[1], attn.num_kv_heads, attn.head_dim,
                 indices = indices)
         qf = q.reshape(bsz * seq, attn.num_q_heads, attn.head_dim).contiguous()
-        page_size = layer.k.shape[1]
+        # Quant caches pack pages into .qk and have no .k; the staged path below is fp16-only.
+        page_size = layer.qk.shape[1] if isinstance(layer, CacheLayer_quant) else layer.k.shape[1]
 
         # Host-resident K/V: every row of a prefill chunk would otherwise pull its own ~2048
         # selections across PCIe, re-reading the same history thousands of times per chunk. Stage
