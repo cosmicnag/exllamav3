@@ -12,7 +12,7 @@
 > [!IMPORTANT]
 > This is a fork of [turboderp-org/exllamav3](https://github.com/turboderp-org/exllamav3), kept for serving **Qwen3.8-Flash-Next (EXL3)** at very long context. Everything below this section is upstream's README and applies unchanged — the only fork-specific content is this section.
 
-**Branch** [`deploy/exllamav3-kvo`](https://github.com/cosmicnag/exllamav3/tree/deploy/exllamav3-kvo) · **Base** upstream `dev` @ `e3b52f47` · **Delta** 2 commits, **Python only**
+**Branch** [`deploy/exllamav3-kvo`](https://github.com/cosmicnag/exllamav3/tree/deploy/exllamav3-kvo) · **Base** upstream `dev` @ `e3b52f47` · **Delta** 2 commits, **Python only** (+ 1 README commit on top)
 
 ### What it adds
 
@@ -75,9 +75,9 @@ TabbyAPI users can pass `-kvo` as a model arg instead. **Omitting it silently lo
 
 ### For agents
 
-- Branch `deploy/exllamav3-kvo` = upstream `dev` @ `e3b52f47` + `db8fefec` (the port) + `0ceb06ef` (`page_size` lookup fix in `QSAIndexer.sparse_attend` for quant caches).
+- Branch `deploy/exllamav3-kvo` tip `7b530350` (this README) = upstream `dev` @ `e3b52f47` + `db8fefec` (the port) + `0ceb06ef` (`page_size` lookup fix in `QSAIndexer.sparse_attend` for quant caches). **Code tip is `0ceb06ef`** — use it, not the branch tip, when diffing for code.
 - Touched files: `exllamav3/cache/qsa_offload.py` (new), `exllamav3/util/qsa_kvo_stats.py` (new), `exllamav3/modules/attention_fn/qsa_triton.py`, `exllamav3/modules/qsa_indexer.py`, `exllamav3/modules/attn.py`, `exllamav3/model/config.py`, `exllamav3/model_init.py`, `exllamav3/generator/cpu_cache.py`.
-- **The 2 commits are pure Python.** If your build is a *non-editable* install of base `e3b52f47`, copying those 8 files into site-packages *is* the deploy — no CUDA extension rebuild. Confirm with `git diff --name-only e3b52f47..deploy/exllamav3-kvo | grep -v '\.py$'` (empty) and by checking that no `ext.*` symbol appears only on the `+` side of the Python diff.
+- **The 2 commits are pure Python.** If your build is a *non-editable* install of base `e3b52f47`, copying those 8 files into site-packages *is* the deploy — no CUDA extension rebuild. Confirm with `git diff --name-only e3b52f47..0ceb06ef | grep -v '\.py$'` (empty) and by checking that no `ext.*` symbol appears only on the `+` side of the Python diff. If your install sits on an *older* base, also copy the upstream `.py` files in your base's range — the base move from `8271af4e` to `e3b52f47` alone carried 12 of them.
 - `direct_url.json` in site-packages may name a different source tree than the one actually installed; diff the tree instead of trusting it.
 - Failure modes: `--kv_offload` + `--cpu_cache_size` raises at startup; a quantized cache raises in `attn.py`; without `EXL3_QSA_KV_OFFLOAD=1` you get a silent fp16 load that OOMs at any cache size the offload was needed for.
 
